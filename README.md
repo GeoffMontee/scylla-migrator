@@ -41,7 +41,7 @@ Both options will produce the .jar file to use in `spark-submit` command at path
 
 The `deploy_spark_cluster.py` helper can create an AWS- or GCP-backed Spark cluster, configure it with the existing Ansible playbook, run a Migrator job, show cluster details, and tear the cluster down.
 
-The script uses Terraform for cloud infrastructure and Ansible for Spark/Migrator setup. It does not use Docker. Generated Terraform files, Terraform state, Ansible inventory, deployment metadata, and SSH `known_hosts` data are stored in `.deploy_spark_cluster/` by default. Use a different `--state-dir` for each cluster; commands such as `show`, `run`, `redeploy`, and `destroy` operate on the cluster recorded in that directory.
+The script uses Terraform for cloud infrastructure and Ansible for Spark/Migrator setup. It does not use Docker. Generated Terraform files, Terraform state, Ansible inventory, deployment metadata, and SSH `known_hosts` data are stored in `.deploy_spark_cluster/` by default. Use a different `--state-dir` for each cluster; commands such as `show`, `run`, `redeploy`, and `destroy` operate on the cluster recorded in that directory. A deploy using a different cloud provider is rejected when the state directory already contains a deployment, preventing Terraform from replacing the existing provider's configuration.
 
 ### Prerequisites
 
@@ -85,7 +85,7 @@ To explicitly use a service account key file:
   --allowed-web-cidr "$MY_CIDR"
 ```
 
-The explicit file must be a valid service account JSON key containing `project_id`, `client_email`, and `private_key`. The key contents are never copied into the state directory or onto cluster VMs. The resolved path is saved in restricted deployment metadata and reused by later commands; pass `--gcp-service-account-file` again to override it if the file moves. Treat both the key and the state directory as sensitive.
+The explicit file must be a valid service account JSON key containing `project_id`, `client_email`, and `private_key`. The key contents are never copied into the state directory or onto cluster VMs. The provider and resolved credential path are saved in restricted deployment metadata before Terraform apply, so a partially created deployment can still be destroyed with the selected credentials. Successful applies refresh that metadata with Terraform outputs. Pass `--gcp-service-account-file` again to override the saved path if the file moves. Treat both the key and the state directory as sensitive.
 
 Provisioning credentials and VM runtime credentials are separate. `--gcp-service-account-file` authenticates local Terraform only. To give the cluster VMs access to Google Cloud APIs, use `--gcp-instance-service-account SERVICE_ACCOUNT_EMAIL`; the script attaches it with the `cloud-platform` OAuth scope, while its effective access remains limited by IAM roles granted outside this script.
 
@@ -165,7 +165,7 @@ Provisioning credentials and VM runtime credentials are separate. `--gcp-service
      --allowed-web-cidr "$MY_CIDR"
    ```
 
-   An existing subnet must have outbound internet access so Ansible can download packages, Spark, AWS CLI, and the Migrator assembly. The script still creates provider-specific SSH, cluster-internal, and master UI access rules in the supplied network.
+   An existing subnet must have outbound internet access so Ansible can download packages, Spark, AWS CLI, and the Migrator assembly. The script still creates provider-specific SSH, cluster-internal, and master UI access rules in the supplied network. On GCP, the all-protocol internal rule accepts traffic only from instances carrying the cluster tag, rather than from every VM in the subnetwork.
 
 4. Inspect the created infrastructure and Spark endpoints:
 

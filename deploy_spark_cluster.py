@@ -572,7 +572,6 @@ locals {
   use_existing_network = var.existing_network != ""
   network_id           = local.use_existing_network ? data.google_compute_network.existing[0].self_link : google_compute_network.spark[0].self_link
   subnetwork_id        = local.use_existing_network ? data.google_compute_subnetwork.existing[0].self_link : google_compute_subnetwork.public[0].self_link
-  subnetwork_cidr      = local.use_existing_network ? data.google_compute_subnetwork.existing[0].ip_cidr_range : var.public_subnet_cidr
   cluster_tag          = "${var.name_prefix}-cluster"
   master_tag           = "${var.name_prefix}-master"
   owner_labels         = var.owner_tag == "" ? {} : { owner = var.owner_tag }
@@ -602,12 +601,12 @@ resource "google_compute_subnetwork" "public" {
 }
 
 resource "google_compute_firewall" "spark_internal" {
-  name          = "${var.name_prefix}-internal"
-  project       = var.project_id
-  network       = local.network_id
-  direction     = "INGRESS"
-  source_ranges = [local.subnetwork_cidr]
-  target_tags   = [local.cluster_tag]
+  name        = "${var.name_prefix}-internal"
+  project     = var.project_id
+  network     = local.network_id
+  direction   = "INGRESS"
+  source_tags = [local.cluster_tag]
+  target_tags = [local.cluster_tag]
 
   allow {
     protocol = "all"
@@ -1815,6 +1814,31 @@ def load_metadata(state_dir: Path) -> dict[str, Any]:
     return read_json(state_dir / "metadata.json")
 
 
+def validate_existing_deployment_provider(
+    state_dir: Path,
+    requested_provider: str,
+) -> dict[str, Any]:
+    metadata_path = state_dir / "metadata.json"
+    terraform_state = state_dir / "terraform.tfstate"
+    if not metadata_path.is_file() and not terraform_state.is_file():
+        return {}
+
+    metadata = read_json(metadata_path)
+    existing_provider = metadata.get("cloud_provider", "aws")
+    if existing_provider not in CLOUD_PROVIDERS:
+        raise SystemExit(
+            f"Unsupported cloud provider in {metadata_path}: {existing_provider!r}"
+        )
+    if existing_provider != requested_provider:
+        raise SystemExit(
+            f"State directory {state_dir} contains an existing "
+            f"{existing_provider.upper()} deployment; refusing to replace it with "
+            f"{requested_provider.upper()} configuration. Use a different --state-dir "
+            "for the new cluster."
+        )
+    return metadata
+
+
 def require_terraform_state(state_dir: Path) -> None:
     if not state_dir.is_dir():
         raise SystemExit(f"State directory does not exist: {state_dir}")
@@ -1994,6 +2018,10 @@ def handle_deploy(args: argparse.Namespace) -> None:
     state_dir = resolve_state_dir(args.state_dir)
     deploy_config_file = resolve_path(args.config_file)
     validate_local_config_file(deploy_config_file)
+    existing_metadata = validate_existing_deployment_provider(
+        state_dir,
+        args.cloud_provider,
+    )
     terraform_env = terraform_auth_env(
         args.cloud_provider,
         args.gcp_service_account_file,
@@ -2018,6 +2046,13 @@ def handle_deploy(args: argparse.Namespace) -> None:
         ["terraform", "init", "-input=false"],
         cwd=state_dir,
         env=terraform_env,
+    )
+    save_metadata(
+        args,
+        state_dir=state_dir,
+        private_key=private_key,
+        gcp_service_account_file=gcp_service_account_file,
+        outputs=existing_metadata.get("terraform_outputs", {}),
     )
     run_command(
         ["terraform", "apply", "-auto-approve"],

@@ -426,6 +426,56 @@ class DeploySparkClusterScriptTest extends munit.FunSuite {
     assert(!result.output.contains("SSH private key does not exist"), result.output)
   }
 
+  test("deploy refuses provider switches before rewriting the state directory") {
+    val result = runPython(
+      "-c",
+      s"""import importlib.util, tempfile
+         |from pathlib import Path
+         |spec = importlib.util.spec_from_file_location("deploy_spark_cluster", "${script}")
+         |module = importlib.util.module_from_spec(spec)
+         |spec.loader.exec_module(module)
+         |with tempfile.TemporaryDirectory() as temp_dir:
+         |    temp_path = Path(temp_dir)
+         |    public_key = temp_path / "id_rsa.pub"
+         |    public_key.write_text("ssh-rsa AAAAB3NzaTest user@example\\n")
+         |    for existing_provider, requested_provider in (("aws", "gcp"), ("gcp", "aws")):
+         |        state_dir = temp_path / (existing_provider + "-state")
+         |        state_dir.mkdir()
+         |        original_main = "# existing " + existing_provider + " configuration\\n"
+         |        (state_dir / "main.tf").write_text(original_main)
+         |        (state_dir / "terraform.tfstate").write_text("{}")
+         |        module.write_json(
+         |            state_dir / "metadata.json",
+         |            {"cloud_provider": existing_provider},
+         |        )
+         |        command = [
+         |            "deploy",
+         |            "--cloud-provider", requested_provider,
+         |            "--state-dir", str(state_dir),
+         |            "--skip-ansible",
+         |            "--ssh-public-key", str(public_key),
+         |            "--allowed-ssh-cidr", "203.0.113.10/32",
+         |            "--allowed-web-cidr", "203.0.113.10/32",
+         |        ]
+         |        if requested_provider == "gcp":
+         |            command.extend(["--gcp-project", "example-project"])
+         |        args = module.build_parser().parse_args(command)
+         |        try:
+         |            module.handle_deploy(args)
+         |        except SystemExit as exc:
+         |            print(exc)
+         |        print("main_unchanged=" + str((state_dir / "main.tf").read_text() == original_main))
+         |        print("known_hosts_created=" + str((state_dir / "known_hosts").exists()))
+         |""".stripMargin
+    )
+
+    assertEquals(result.exitCode, 0, result.output)
+    assertOutputContains(result.output, "contains an existing AWS deployment")
+    assertOutputContains(result.output, "contains an existing GCP deployment")
+    assertEquals(result.output.split("main_unchanged=True", -1).length - 1, 2)
+    assertEquals(result.output.split("known_hosts_created=False", -1).length - 1, 2)
+  }
+
   test("skip-ansible deploy accepts a public key without resolving a private key") {
     val result = runPython(
       "-c",
@@ -530,6 +580,10 @@ class DeploySparkClusterScriptTest extends munit.FunSuite {
          |        env = kwargs.get("env") or {}
          |        print("run=" + " ".join(command))
          |        print("run_credentials=" + str(env.get("GOOGLE_APPLICATION_CREDENTIALS") == expected_credentials))
+         |        if command[1] == "apply":
+         |            preliminary = module.read_json(state_dir / "metadata.json")
+         |            print("preapply_provider=" + preliminary["cloud_provider"])
+         |            print("preapply_credentials=" + str(preliminary["gcp_service_account_file"] == expected_credentials))
          |    module.run_command = fake_run
          |    def fake_output(state_dir, *, env=None):
          |        print("output_credentials=" + str(env["GOOGLE_APPLICATION_CREDENTIALS"] == expected_credentials))
@@ -559,6 +613,8 @@ class DeploySparkClusterScriptTest extends munit.FunSuite {
     assertOutputContains(result.output, "required=terraform")
     assertEquals(result.output.split("run_credentials=True", -1).length - 1, 2)
     assertOutputContains(result.output, "output_credentials=True")
+    assertOutputContains(result.output, "preapply_provider=gcp")
+    assertOutputContains(result.output, "preapply_credentials=True")
     assertOutputContains(result.output, "provider=gcp")
     assertOutputContains(result.output, "credentials_saved=True")
     assertOutputContains(result.output, "master_type=n2-custom-8-262144-ext")
@@ -672,8 +728,10 @@ class DeploySparkClusterScriptTest extends munit.FunSuite {
          |        'output "spark_master_url"',
          |        'output "ssh_firewall_id"',
          |        'block-project-ssh-keys = "true"',
+         |        'source_tags = [local.cluster_tag]',
          |    ):
          |        print(expected in main)
+         |    print('source_ranges = [local.subnetwork_cidr]' not in main)
          |""".stripMargin
     )
 
@@ -688,6 +746,8 @@ class DeploySparkClusterScriptTest extends munit.FunSuite {
         "existing-network existing-subnetwork",
         "spark@example-project.iam.gserviceaccount.com",
         "False",
+        "True",
+        "True",
         "True",
         "True",
         "True",
