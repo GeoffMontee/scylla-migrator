@@ -3,7 +3,7 @@
 
 This script owns the cloud infrastructure lifecycle with Terraform and uses
 the existing Ansible playbook in ./ansible to install Spark and Migrator on the
-created EC2 instances.
+created AWS EC2 or Google Compute Engine instances.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import argparse
 import ipaddress
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -34,9 +35,19 @@ DEFAULT_USER = "ubuntu"
 STATE_DIR_MARKER = ".scylla-migrator-state"
 REMOTE_MIGRATOR_DIR = "/home/ubuntu/scylla-migrator"
 MIGRATION_TYPES = ("cql", "alternator")
+CLOUD_PROVIDERS = ("aws", "gcp")
+AWS_DEFAULT_REGION = "us-east-1"
+AWS_DEFAULT_MASTER_INSTANCE_TYPE = "x2iedn.2xlarge"
+AWS_DEFAULT_WORKER_INSTANCE_TYPE = "i8g.4xlarge"
+GCP_DEFAULT_REGION = "us-central1"
+GCP_DEFAULT_ZONE = "us-central1-a"
+GCP_DEFAULT_MASTER_INSTANCE_TYPE = "n2-custom-8-262144-ext"
+GCP_DEFAULT_WORKER_INSTANCE_TYPE = "c4a-highmem-16"
+AWS_DEFAULT_VPC_CIDR = "10.42.0.0/16"
+DEFAULT_SUBNET_CIDR = "10.42.1.0/24"
 
 
-TERRAFORM_MAIN = """terraform {
+AWS_TERRAFORM_MAIN = """terraform {
   required_version = ">= 1.3.0"
 
   required_providers {
@@ -433,6 +444,365 @@ output "spark_history_ui" {
 """
 
 
+GCP_TERRAFORM_MAIN = """terraform {
+  required_version = ">= 1.3.0"
+
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 7.0"
+    }
+  }
+}
+
+provider "google" {
+  project = var.project_id
+  region  = var.region
+  zone    = var.zone
+}
+
+variable "project_id" {
+  type = string
+}
+
+variable "region" {
+  type = string
+}
+
+variable "zone" {
+  type = string
+}
+
+variable "name_prefix" {
+  type = string
+}
+
+variable "ssh_public_key_path" {
+  type = string
+}
+
+variable "master_instance_type" {
+  type = string
+}
+
+variable "worker_instance_type" {
+  type = string
+}
+
+variable "worker_count" {
+  type = number
+}
+
+variable "master_image_family" {
+  type = string
+}
+
+variable "worker_image_family" {
+  type = string
+}
+
+variable "master_boot_disk_type" {
+  type = string
+}
+
+variable "worker_boot_disk_type" {
+  type = string
+}
+
+variable "public_subnet_cidr" {
+  type = string
+}
+
+variable "existing_network" {
+  type    = string
+  default = ""
+}
+
+variable "existing_subnetwork" {
+  type    = string
+  default = ""
+}
+
+variable "allowed_ssh_cidr" {
+  type = string
+}
+
+variable "allowed_web_cidr" {
+  type = string
+}
+
+variable "root_volume_size_gb" {
+  type = number
+}
+
+variable "instance_service_account" {
+  type    = string
+  default = ""
+}
+
+variable "owner_tag" {
+  type    = string
+  default = ""
+}
+
+data "google_compute_network" "existing" {
+  count   = var.existing_network == "" ? 0 : 1
+  name    = var.existing_network
+  project = var.project_id
+}
+
+data "google_compute_subnetwork" "existing" {
+  count   = var.existing_subnetwork == "" ? 0 : 1
+  name    = var.existing_subnetwork
+  project = var.project_id
+  region  = var.region
+}
+
+data "google_compute_image" "ubuntu_master" {
+  family  = var.master_image_family
+  project = "ubuntu-os-cloud"
+}
+
+data "google_compute_image" "ubuntu_worker" {
+  family  = var.worker_image_family
+  project = "ubuntu-os-cloud"
+}
+
+locals {
+  use_existing_network = var.existing_network != ""
+  network_id           = local.use_existing_network ? data.google_compute_network.existing[0].self_link : google_compute_network.spark[0].self_link
+  subnetwork_id        = local.use_existing_network ? data.google_compute_subnetwork.existing[0].self_link : google_compute_subnetwork.public[0].self_link
+  subnetwork_cidr      = local.use_existing_network ? data.google_compute_subnetwork.existing[0].ip_cidr_range : var.public_subnet_cidr
+  cluster_tag          = "${var.name_prefix}-cluster"
+  master_tag           = "${var.name_prefix}-master"
+  owner_labels         = var.owner_tag == "" ? {} : { owner = var.owner_tag }
+  ssh_metadata = {
+    block-project-ssh-keys = "true"
+    enable-oslogin         = "FALSE"
+    ssh-keys               = "ubuntu:${trimspace(file(var.ssh_public_key_path))}"
+  }
+}
+
+resource "google_compute_network" "spark" {
+  count                   = local.use_existing_network ? 0 : 1
+  name                    = "${var.name_prefix}-vpc"
+  project                 = var.project_id
+  auto_create_subnetworks = false
+  routing_mode            = "REGIONAL"
+}
+
+resource "google_compute_subnetwork" "public" {
+  count                    = local.use_existing_network ? 0 : 1
+  name                     = "${var.name_prefix}-public-subnet"
+  project                  = var.project_id
+  region                   = var.region
+  network                  = google_compute_network.spark[0].id
+  ip_cidr_range            = var.public_subnet_cidr
+  private_ip_google_access = true
+}
+
+resource "google_compute_firewall" "spark_internal" {
+  name          = "${var.name_prefix}-internal"
+  project       = var.project_id
+  network       = local.network_id
+  direction     = "INGRESS"
+  source_ranges = [local.subnetwork_cidr]
+  target_tags   = [local.cluster_tag]
+
+  allow {
+    protocol = "all"
+  }
+
+  lifecycle {
+    precondition {
+      condition = (
+        !local.use_existing_network ||
+        data.google_compute_subnetwork.existing[0].network == data.google_compute_network.existing[0].self_link
+      )
+      error_message = "The selected GCP subnetwork does not belong to the selected network."
+    }
+  }
+}
+
+resource "google_compute_firewall" "spark_ssh" {
+  name          = "${var.name_prefix}-ssh"
+  project       = var.project_id
+  network       = local.network_id
+  direction     = "INGRESS"
+  source_ranges = [var.allowed_ssh_cidr]
+  target_tags   = [local.cluster_tag]
+
+  allow {
+    protocol = "tcp"
+    ports    = ["22"]
+  }
+}
+
+resource "google_compute_firewall" "spark_master_ui" {
+  name          = "${var.name_prefix}-master-ui"
+  project       = var.project_id
+  network       = local.network_id
+  direction     = "INGRESS"
+  source_ranges = [var.allowed_web_cidr]
+  target_tags   = [local.master_tag]
+
+  allow {
+    protocol = "tcp"
+    ports    = ["4040", "8080", "18080"]
+  }
+}
+
+resource "google_compute_instance" "spark_master" {
+  name                      = "${var.name_prefix}-master"
+  project                   = var.project_id
+  zone                      = var.zone
+  machine_type              = var.master_instance_type
+  allow_stopping_for_update = true
+  tags                      = [local.cluster_tag, local.master_tag]
+  labels                    = merge({ role = "spark-master" }, local.owner_labels)
+  metadata                  = local.ssh_metadata
+
+  boot_disk {
+    initialize_params {
+      image = data.google_compute_image.ubuntu_master.self_link
+      size  = var.root_volume_size_gb
+      type  = var.master_boot_disk_type
+    }
+  }
+
+  network_interface {
+    subnetwork = local.subnetwork_id
+
+    access_config {
+      network_tier = "PREMIUM"
+    }
+  }
+
+  dynamic "service_account" {
+    for_each = var.instance_service_account == "" ? [] : [var.instance_service_account]
+
+    content {
+      email  = service_account.value
+      scopes = ["cloud-platform"]
+    }
+  }
+
+  shielded_instance_config {
+    enable_integrity_monitoring = true
+    enable_secure_boot          = true
+    enable_vtpm                 = true
+  }
+}
+
+resource "google_compute_instance" "spark_worker" {
+  count                     = var.worker_count
+  name                      = "${var.name_prefix}-worker-${count.index + 1}"
+  project                   = var.project_id
+  zone                      = var.zone
+  machine_type              = var.worker_instance_type
+  allow_stopping_for_update = true
+  tags                      = [local.cluster_tag]
+  labels                    = merge({ role = "spark-worker" }, local.owner_labels)
+  metadata                  = local.ssh_metadata
+
+  boot_disk {
+    initialize_params {
+      image = data.google_compute_image.ubuntu_worker.self_link
+      size  = var.root_volume_size_gb
+      type  = var.worker_boot_disk_type
+    }
+  }
+
+  network_interface {
+    subnetwork = local.subnetwork_id
+
+    access_config {
+      network_tier = "PREMIUM"
+    }
+  }
+
+  dynamic "service_account" {
+    for_each = var.instance_service_account == "" ? [] : [var.instance_service_account]
+
+    content {
+      email  = service_account.value
+      scopes = ["cloud-platform"]
+    }
+  }
+
+  shielded_instance_config {
+    enable_integrity_monitoring = true
+    enable_secure_boot          = true
+    enable_vtpm                 = true
+  }
+}
+
+output "region" {
+  value = var.region
+}
+
+output "vpc_id" {
+  value = local.network_id
+}
+
+output "public_subnet_id" {
+  value = local.subnetwork_id
+}
+
+output "cluster_security_group_id" {
+  value = google_compute_firewall.spark_internal.id
+}
+
+output "ssh_firewall_id" {
+  value = google_compute_firewall.spark_ssh.id
+}
+
+output "master_ui_security_group_id" {
+  value = google_compute_firewall.spark_master_ui.id
+}
+
+output "key_name" {
+  value = "ubuntu (instance metadata)"
+}
+
+output "master" {
+  value = {
+    name        = "spark_master"
+    instance_id = google_compute_instance.spark_master.instance_id
+    public_ip   = google_compute_instance.spark_master.network_interface[0].access_config[0].nat_ip
+    private_ip  = google_compute_instance.spark_master.network_interface[0].network_ip
+  }
+}
+
+output "workers" {
+  value = [
+    for idx, worker in google_compute_instance.spark_worker : {
+      name        = "spark_worker${idx + 1}"
+      instance_id = worker.instance_id
+      public_ip   = worker.network_interface[0].access_config[0].nat_ip
+      private_ip  = worker.network_interface[0].network_ip
+    }
+  ]
+}
+
+output "spark_master_url" {
+  value = "spark://${google_compute_instance.spark_master.network_interface[0].network_ip}:7077"
+}
+
+output "spark_master_ui" {
+  value = "http://${google_compute_instance.spark_master.network_interface[0].access_config[0].nat_ip}:8080"
+}
+
+output "spark_application_ui" {
+  value = "http://${google_compute_instance.spark_master.network_interface[0].access_config[0].nat_ip}:4040"
+}
+
+output "spark_history_ui" {
+  value = "http://${google_compute_instance.spark_master.network_interface[0].access_config[0].nat_ip}:18080"
+}
+"""
+
+
 def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
@@ -553,11 +923,16 @@ def parse_terraform_output_json(stdout: str) -> dict[str, Any]:
     return outputs
 
 
-def terraform_output(state_dir: Path) -> dict[str, Any]:
+def terraform_output(
+    state_dir: Path,
+    *,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
     completed = run_command(
         ["terraform", "output", "-json"],
         cwd=state_dir,
         capture_output=True,
+        env=env,
     )
     outputs = parse_terraform_output_json(completed.stdout)
     validate_terraform_output_ips(outputs)
@@ -582,6 +957,98 @@ def read_json(path: Path) -> dict[str, Any]:
         return json.loads(path.read_text())
     except json.JSONDecodeError as exc:
         raise SystemExit(f"Invalid JSON in {path}: {exc}") from exc
+
+
+def apply_cloud_defaults(args: argparse.Namespace) -> None:
+    if args.cloud_provider == "aws":
+        args.region = args.region or AWS_DEFAULT_REGION
+        args.vpc_cidr = args.vpc_cidr or AWS_DEFAULT_VPC_CIDR
+        args.master_instance_type = (
+            args.master_instance_type or AWS_DEFAULT_MASTER_INSTANCE_TYPE
+        )
+        args.worker_instance_type = (
+            args.worker_instance_type or AWS_DEFAULT_WORKER_INSTANCE_TYPE
+        )
+        return
+
+    if args.zone and not args.region:
+        args.region = args.zone.rsplit("-", 1)[0]
+    args.region = args.region or GCP_DEFAULT_REGION
+    args.zone = args.zone or f"{args.region}-a"
+    args.master_instance_type = (
+        args.master_instance_type or GCP_DEFAULT_MASTER_INSTANCE_TYPE
+    )
+    args.worker_instance_type = (
+        args.worker_instance_type or GCP_DEFAULT_WORKER_INSTANCE_TYPE
+    )
+
+
+def validate_gcp_service_account_file(path: Path) -> None:
+    if not path.exists():
+        raise SystemExit(f"GCP service account file does not exist: {path}")
+    if not path.is_file():
+        raise SystemExit(f"GCP service account path is not a file: {path}")
+
+    try:
+        credentials = json.loads(path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Invalid JSON in GCP service account file {path}: {exc}") from exc
+
+    if not isinstance(credentials, dict) or credentials.get("type") != "service_account":
+        raise SystemExit(
+            f"GCP credential file is not a service account key: {path}. "
+            "Expected a JSON object with type='service_account'."
+        )
+
+    required_fields = ("project_id", "client_email", "private_key")
+    missing = [field for field in required_fields if not credentials.get(field)]
+    if missing:
+        raise SystemExit(
+            f"GCP service account file is missing required field(s): {', '.join(missing)}"
+        )
+
+
+def resolve_gcp_service_account_file(
+    explicit_value: str | None,
+    metadata: dict[str, Any] | None = None,
+) -> Path | None:
+    saved_value = metadata.get("gcp_service_account_file") if metadata else None
+    selected_value = explicit_value if explicit_value is not None else saved_value
+    credentials_file = resolve_path(selected_value)
+    if credentials_file is None:
+        return None
+    validate_gcp_service_account_file(credentials_file)
+    return credentials_file
+
+
+def terraform_auth_env(
+    cloud_provider: str,
+    explicit_service_account_file: str | None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, str] | None:
+    if cloud_provider != "gcp":
+        if explicit_service_account_file:
+            raise SystemExit("--gcp-service-account-file can only be used with GCP.")
+        return None
+
+    credentials_file = resolve_gcp_service_account_file(
+        explicit_service_account_file,
+        metadata,
+    )
+    if credentials_file is None:
+        return None
+    return {"GOOGLE_APPLICATION_CREDENTIALS": str(credentials_file)}
+
+
+def saved_deployment_terraform_env(
+    args: argparse.Namespace,
+    metadata: dict[str, Any],
+) -> dict[str, str] | None:
+    return terraform_auth_env(
+        metadata.get("cloud_provider", "aws"),
+        args.gcp_service_account_file,
+        metadata,
+    )
 
 
 def infer_aws_architecture(instance_type: str) -> str:
@@ -617,6 +1084,45 @@ def infer_aws_architecture(instance_type: str) -> str:
     if family in arm64_families:
         return "arm64"
     return "x86_64"
+
+
+def infer_gcp_architecture(instance_type: str) -> str:
+    family = instance_type.split("-", 1)[0].lower()
+    if family in {"a4x", "c4a", "n4a", "t2a"}:
+        return "arm64"
+    return "x86_64"
+
+
+def gcp_image_family(instance_type: str) -> str:
+    architecture = infer_gcp_architecture(instance_type)
+    if architecture == "arm64":
+        return "ubuntu-2404-lts-arm64"
+    return "ubuntu-2404-lts-amd64"
+
+
+def gcp_boot_disk_type(instance_type: str) -> str:
+    family = instance_type.split("-", 1)[0].lower()
+    hyperdisk_only_families = {
+        "a4x",
+        "c3",
+        "c3d",
+        "c4",
+        "c4a",
+        "c4d",
+        "c4n",
+        "h3",
+        "h4d",
+        "m3",
+        "m4",
+        "m4n",
+        "n4",
+        "n4a",
+        "n4d",
+        "z3",
+    }
+    if family in hyperdisk_only_families:
+        return "hyperdisk-balanced"
+    return "pd-balanced"
 
 
 def known_hosts_path(state_dir: Path) -> Path:
@@ -904,12 +1410,7 @@ def resolve_ssh_private_key(
     return private_key
 
 
-def write_terraform_files(args: argparse.Namespace, state_dir: Path) -> None:
-    state_dir.mkdir(parents=True, exist_ok=True)
-    state_dir.chmod(0o700)
-    write_state_dir_marker(state_dir)
-    (state_dir / "main.tf").write_text(TERRAFORM_MAIN)
-
+def resolve_ssh_public_key(args: argparse.Namespace) -> Path:
     public_key = resolve_path(args.ssh_public_key)
     private_key = resolve_path(args.ssh_private_key)
     if public_key is None:
@@ -921,8 +1422,11 @@ def write_terraform_files(args: argparse.Namespace, state_dir: Path) -> None:
         raise SystemExit(f"SSH public key does not exist: {public_key}")
     if not public_key.is_file():
         raise SystemExit(f"SSH public key path is not a file: {public_key}")
+    return public_key
 
-    tfvars = {
+
+def aws_terraform_vars(args: argparse.Namespace, public_key: Path) -> dict[str, Any]:
+    return {
         "region": args.region,
         "name_prefix": args.name_prefix,
         "key_name": args.key_name or f"{args.name_prefix}-key",
@@ -942,6 +1446,54 @@ def write_terraform_files(args: argparse.Namespace, state_dir: Path) -> None:
         "iam_instance_profile": args.iam_instance_profile or "",
         "owner_tag": args.owner_tag or "",
     }
+
+
+def gcp_terraform_vars(args: argparse.Namespace, public_key: Path) -> dict[str, Any]:
+    return {
+        "project_id": args.gcp_project,
+        "region": args.region,
+        "zone": args.zone,
+        "name_prefix": args.name_prefix,
+        "ssh_public_key_path": str(public_key),
+        "master_instance_type": args.master_instance_type,
+        "worker_instance_type": args.worker_instance_type,
+        "worker_count": args.workers,
+        "master_image_family": gcp_image_family(args.master_instance_type),
+        "worker_image_family": gcp_image_family(args.worker_instance_type),
+        "master_boot_disk_type": (
+            args.gcp_master_boot_disk_type
+            or gcp_boot_disk_type(args.master_instance_type)
+        ),
+        "worker_boot_disk_type": (
+            args.gcp_worker_boot_disk_type
+            or gcp_boot_disk_type(args.worker_instance_type)
+        ),
+        "public_subnet_cidr": args.public_subnet_cidr,
+        "existing_network": args.network or "",
+        "existing_subnetwork": args.subnetwork or "",
+        "allowed_ssh_cidr": args.allowed_ssh_cidr,
+        "allowed_web_cidr": args.allowed_web_cidr,
+        "root_volume_size_gb": args.root_volume_size_gb,
+        "instance_service_account": args.gcp_instance_service_account or "",
+        "owner_tag": args.owner_tag or "",
+    }
+
+
+def write_terraform_files(args: argparse.Namespace, state_dir: Path) -> None:
+    apply_cloud_defaults(args)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_dir.chmod(0o700)
+    write_state_dir_marker(state_dir)
+    public_key = resolve_ssh_public_key(args)
+
+    if args.cloud_provider == "aws":
+        terraform_main = AWS_TERRAFORM_MAIN
+        tfvars = aws_terraform_vars(args, public_key)
+    else:
+        terraform_main = GCP_TERRAFORM_MAIN
+        tfvars = gcp_terraform_vars(args, public_key)
+
+    (state_dir / "main.tf").write_text(terraform_main)
     write_json(state_dir / "terraform.tfvars.json", tfvars)
 
 
@@ -1227,12 +1779,14 @@ def save_metadata(
     *,
     state_dir: Path,
     private_key: Path | None,
+    gcp_service_account_file: Path | None,
     outputs: dict[str, Any],
 ) -> None:
     metadata = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "cloud_provider": args.cloud_provider,
         "region": args.region,
+        "zone": args.zone or "",
         "name_prefix": args.name_prefix,
         "master_instance_type": args.master_instance_type,
         "worker_instance_type": args.worker_instance_type,
@@ -1240,6 +1794,13 @@ def save_metadata(
         "owner_tag": args.owner_tag or "",
         "vpc_id": args.vpc_id or "",
         "subnet_id": args.subnet_id or "",
+        "gcp_project": args.gcp_project or "",
+        "network": args.network or "",
+        "subnetwork": args.subnetwork or "",
+        "gcp_service_account_file": (
+            str(gcp_service_account_file) if gcp_service_account_file else ""
+        ),
+        "gcp_instance_service_account": args.gcp_instance_service_account or "",
         "migration_type": args.migration_type,
         "config_file": str(resolve_path(args.config_file)) if args.config_file else "",
         "ssh_private_key": str(private_key) if private_key is not None else "",
@@ -1322,12 +1883,7 @@ def validate_access_cidrs(args: argparse.Namespace) -> None:
         )
 
 
-def validate_network_args(args: argparse.Namespace) -> None:
-    if bool(args.vpc_id) != bool(args.subnet_id):
-        raise SystemExit("--vpc-id and --subnet-id must be provided together.")
-    if args.vpc_id and args.subnet_id:
-        return
-
+def validate_generated_network_cidrs(args: argparse.Namespace) -> None:
     try:
         vpc_network = ipaddress.ip_network(args.vpc_cidr, strict=False)
         subnet_network = ipaddress.ip_network(args.public_subnet_cidr, strict=False)
@@ -1343,15 +1899,108 @@ def validate_network_args(args: argparse.Namespace) -> None:
         )
 
 
+def validate_aws_network_args(args: argparse.Namespace) -> None:
+    if bool(args.vpc_id) != bool(args.subnet_id):
+        raise SystemExit("--vpc-id and --subnet-id must be provided together.")
+    if args.vpc_id and args.subnet_id:
+        return
+    validate_generated_network_cidrs(args)
+
+
+def validate_gcp_network_args(args: argparse.Namespace) -> None:
+    if bool(args.network) != bool(args.subnetwork):
+        raise SystemExit("--network and --subnetwork must be provided together.")
+    if args.network and args.subnetwork:
+        return
+    try:
+        subnet_network = ipaddress.ip_network(args.public_subnet_cidr, strict=False)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid subnet CIDR: {exc}") from exc
+    if subnet_network.version != 4:
+        raise SystemExit("--public-subnet-cidr must be an IPv4 CIDR.")
+
+
+def validate_gcp_args(args: argparse.Namespace) -> None:
+    if not args.gcp_project:
+        raise SystemExit("--gcp-project is required when --cloud-provider=gcp.")
+    if args.vpc_id or args.subnet_id:
+        raise SystemExit(
+            "--vpc-id and --subnet-id are AWS-only; use --network and "
+            "--subnetwork for an existing GCP network."
+        )
+    if args.vpc_cidr:
+        raise SystemExit(
+            "--vpc-cidr is AWS-only because GCP VPC networks do not have a "
+            "network-wide CIDR; use --public-subnet-cidr for the GCP subnetwork."
+        )
+    if args.key_name:
+        raise SystemExit("--key-name can only be used with AWS.")
+    if args.iam_instance_profile:
+        raise SystemExit("--iam-instance-profile can only be used with AWS.")
+
+    if not re.fullmatch(r"[a-z]+(?:-[a-z0-9]+)+-[a-z]", args.zone):
+        raise SystemExit(f"Invalid GCP zone: {args.zone!r}. Expected a zone such as us-central1-a.")
+    if args.zone.rsplit("-", 1)[0] != args.region:
+        raise SystemExit(
+            f"GCP zone {args.zone!r} is not in the selected region {args.region!r}."
+        )
+    if len(args.name_prefix) > 49 or not re.fullmatch(
+        r"[a-z](?:[-a-z0-9]*[a-z0-9])?",
+        args.name_prefix,
+    ):
+        raise SystemExit(
+            "For GCP, --name-prefix must be at most 49 characters and contain "
+            "only lowercase letters, digits, and hyphens; it must start with a "
+            "letter and end with a letter or digit."
+        )
+    if args.owner_tag and not re.fullmatch(
+        r"[a-z0-9](?:[-_a-z0-9]*[a-z0-9])?",
+        args.owner_tag,
+    ):
+        raise SystemExit(
+            "For GCP, --owner-tag must contain only lowercase letters, digits, "
+            "underscores, and hyphens, and must start and end with a letter or digit."
+        )
+    if len(args.owner_tag) > 63:
+        raise SystemExit("For GCP, --owner-tag must be at most 63 characters.")
+    validate_gcp_network_args(args)
+
+
+def validate_cloud_args(args: argparse.Namespace) -> None:
+    apply_cloud_defaults(args)
+    if args.cloud_provider == "gcp":
+        validate_gcp_args(args)
+        return
+
+    gcp_only_args = {
+        "--gcp-project": args.gcp_project,
+        "--zone": args.zone,
+        "--network": args.network,
+        "--subnetwork": args.subnetwork,
+        "--gcp-instance-service-account": args.gcp_instance_service_account,
+        "--gcp-master-boot-disk-type": args.gcp_master_boot_disk_type,
+        "--gcp-worker-boot-disk-type": args.gcp_worker_boot_disk_type,
+    }
+    supplied = [flag for flag, value in gcp_only_args.items() if value]
+    if supplied:
+        raise SystemExit(f"{', '.join(supplied)} can only be used with GCP.")
+    validate_aws_network_args(args)
+
+
 def handle_deploy(args: argparse.Namespace) -> None:
-    if args.cloud_provider != "aws":
-        raise SystemExit("Only AWS is currently supported")
     validate_access_cidrs(args)
-    validate_network_args(args)
+    validate_cloud_args(args)
 
     state_dir = resolve_state_dir(args.state_dir)
     deploy_config_file = resolve_path(args.config_file)
     validate_local_config_file(deploy_config_file)
+    terraform_env = terraform_auth_env(
+        args.cloud_provider,
+        args.gcp_service_account_file,
+    )
+    gcp_service_account_file = (
+        Path(terraform_env["GOOGLE_APPLICATION_CREDENTIALS"]) if terraform_env else None
+    )
 
     private_key = None if args.skip_ansible else resolve_ssh_private_key(args.ssh_private_key)
     known_hosts = known_hosts_path(state_dir)
@@ -1365,10 +2014,24 @@ def handle_deploy(args: argparse.Namespace) -> None:
 
     write_terraform_files(args, state_dir)
     require_commands(required)
-    run_command(["terraform", "init", "-input=false"], cwd=state_dir)
-    run_command(["terraform", "apply", "-auto-approve"], cwd=state_dir)
-    outputs = terraform_output(state_dir)
-    save_metadata(args, state_dir=state_dir, private_key=private_key, outputs=outputs)
+    run_command(
+        ["terraform", "init", "-input=false"],
+        cwd=state_dir,
+        env=terraform_env,
+    )
+    run_command(
+        ["terraform", "apply", "-auto-approve"],
+        cwd=state_dir,
+        env=terraform_env,
+    )
+    outputs = terraform_output(state_dir, env=terraform_env)
+    save_metadata(
+        args,
+        state_dir=state_dir,
+        private_key=private_key,
+        gcp_service_account_file=gcp_service_account_file,
+        outputs=outputs,
+    )
 
     if args.skip_ansible:
         print("Skipping Ansible configuration.")
@@ -1412,12 +2075,17 @@ def handle_deploy(args: argparse.Namespace) -> None:
 def print_cluster_details(outputs: dict[str, Any], *, metadata: dict[str, Any]) -> None:
     master = outputs["master"]
     workers = outputs["workers"]
+    cloud_provider = metadata.get("cloud_provider", "aws") if metadata else "aws"
 
     print("")
     print("Spark cluster")
     if metadata:
-        print(f"  Provider: {metadata.get('cloud_provider', 'aws')}")
+        print(f"  Provider: {cloud_provider}")
+        if cloud_provider == "gcp":
+            print(f"  Project: {metadata.get('gcp_project', 'unknown')}")
         print(f"  Region: {metadata.get('region', outputs.get('region', 'unknown'))}")
+        if cloud_provider == "gcp":
+            print(f"  Zone: {metadata.get('zone', 'unknown')}")
         print(f"  Migration type: {metadata.get('migration_type', 'unknown')}")
     print(f"  Spark master: {outputs['spark_master_url']}")
     print(f"  Spark UI: {outputs['spark_master_ui']}")
@@ -1425,11 +2093,20 @@ def print_cluster_details(outputs: dict[str, Any], *, metadata: dict[str, Any]) 
     print(f"  Spark history UI: {outputs['spark_history_ui']}")
     print("")
     print("Infrastructure")
-    print(f"  VPC: {outputs['vpc_id']}")
-    print(f"  Public subnet: {outputs['public_subnet_id']}")
-    print(f"  Cluster security group: {outputs['cluster_security_group_id']}")
-    print(f"  Master UI security group: {outputs['master_ui_security_group_id']}")
-    print(f"  Key pair: {outputs['key_name']}")
+    if cloud_provider == "gcp":
+        print(f"  Network: {outputs['vpc_id']}")
+        print(f"  Subnetwork: {outputs['public_subnet_id']}")
+        print(f"  Cluster internal firewall: {outputs['cluster_security_group_id']}")
+        if outputs.get("ssh_firewall_id"):
+            print(f"  SSH firewall: {outputs['ssh_firewall_id']}")
+        print(f"  Master UI firewall: {outputs['master_ui_security_group_id']}")
+        print(f"  SSH user/key source: {outputs['key_name']}")
+    else:
+        print(f"  VPC: {outputs['vpc_id']}")
+        print(f"  Public subnet: {outputs['public_subnet_id']}")
+        print(f"  Cluster security group: {outputs['cluster_security_group_id']}")
+        print(f"  Master UI security group: {outputs['master_ui_security_group_id']}")
+        print(f"  Key pair: {outputs['key_name']}")
     print("")
     print("Instances")
     print(
@@ -1448,7 +2125,8 @@ def handle_show(args: argparse.Namespace) -> None:
     require_terraform_state(state_dir)
     require_commands(["terraform"])
     metadata = load_metadata(state_dir)
-    outputs = terraform_output(state_dir)
+    terraform_env = saved_deployment_terraform_env(args, metadata)
+    outputs = terraform_output(state_dir, env=terraform_env)
 
     if args.json:
         print(json.dumps({"metadata": metadata, "terraform_outputs": outputs}, indent=2))
@@ -1463,7 +2141,8 @@ def handle_run(args: argparse.Namespace) -> None:
     require_commands(["terraform", "ssh", "scp"])
     metadata = load_metadata(state_dir)
     migration_type = resolve_migration_type(args.migration_type, metadata)
-    outputs = terraform_output(state_dir)
+    terraform_env = saved_deployment_terraform_env(args, metadata)
+    outputs = terraform_output(state_dir, env=terraform_env)
 
     private_key = resolve_ssh_private_key(args.ssh_private_key, metadata)
     known_hosts = known_hosts_path(state_dir)
@@ -1510,13 +2189,14 @@ def handle_redeploy(args: argparse.Namespace) -> None:
     require_commands(["terraform", "ansible-playbook", "ssh", "scp"])
     metadata = load_metadata(state_dir)
     migration_type = resolve_migration_type(args.migration_type, metadata)
+    terraform_env = saved_deployment_terraform_env(args, metadata)
 
     private_key = resolve_ssh_private_key(args.ssh_private_key, metadata)
 
     known_hosts = known_hosts_path(state_dir)
     insecure = args.insecure_ssh
     redeploy_config_file = config_file_from_args_or_metadata(args.config_file, metadata)
-    outputs = terraform_output(state_dir)
+    outputs = terraform_output(state_dir, env=terraform_env)
     metadata["terraform_outputs"] = outputs
     write_json(state_dir / "metadata.json", metadata)
 
@@ -1560,6 +2240,8 @@ def handle_destroy(args: argparse.Namespace) -> None:
     state_dir = resolve_state_dir(args.state_dir)
     require_terraform_state(state_dir)
     require_commands(["terraform"])
+    metadata = load_metadata(state_dir)
+    terraform_env = saved_deployment_terraform_env(args, metadata)
     if args.delete_state_dir:
         validate_state_dir_safe_to_delete(state_dir)
 
@@ -1573,6 +2255,7 @@ def handle_destroy(args: argparse.Namespace) -> None:
             ["terraform", "destroy", "-auto-approve"],
             cwd=state_dir,
             capture_output=True,
+            env=terraform_env,
         )
     except subprocess.CalledProcessError as exc:
         print("Terraform destroy failed.", file=sys.stderr)
@@ -1589,37 +2272,56 @@ def handle_destroy(args: argparse.Namespace) -> None:
         print(f"Deleted {state_dir}")
 
 
-def build_parser() -> argparse.ArgumentParser:
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument(
-        "--state-dir",
-        default=DEFAULT_STATE_DIR,
-        help="Directory for generated Terraform files, state, inventory, and metadata.",
+def configure_deploy_parser(deploy: argparse.ArgumentParser) -> None:
+    deploy.add_argument("--cloud-provider", choices=CLOUD_PROVIDERS, default="aws")
+    deploy.add_argument(
+        "--region",
+        default=None,
+        help=(
+            f"Cloud region. AWS default: {AWS_DEFAULT_REGION}; "
+            f"GCP default: {GCP_DEFAULT_REGION}."
+        ),
     )
-
-    parser = argparse.ArgumentParser(
-        description="Deploy and operate a Spark cluster for ScyllaDB Migrator.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    deploy.add_argument(
+        "--zone",
+        default=None,
+        help=(
+            f"GCP Compute Engine zone. Defaults to REGION-a "
+            f"({GCP_DEFAULT_ZONE} with the default region)."
+        ),
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    deploy = subparsers.add_parser(
-        "deploy",
-        parents=[common],
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        help="Create AWS infrastructure and configure Spark with Ansible.",
+    deploy.add_argument(
+        "--gcp-project",
+        default="",
+        help="GCP project ID. Required when --cloud-provider=gcp.",
     )
-    deploy.add_argument("--cloud-provider", choices=["aws"], default="aws")
-    deploy.add_argument("--region", default="us-east-1")
     deploy.add_argument("--name-prefix", default="scylla-migrator-spark")
     deploy.add_argument("--key-name", default=None, help="AWS key pair name to create.")
     deploy.add_argument("--ssh-private-key", default="~/.ssh/id_rsa")
     deploy.add_argument("--ssh-public-key", default=None)
-    deploy.add_argument("--master-instance-type", default="x2iedn.2xlarge")
-    deploy.add_argument("--worker-instance-type", default="i8g.4xlarge")
+    deploy.add_argument(
+        "--master-instance-type",
+        default=None,
+        help=(
+            f"Master machine type. AWS default: {AWS_DEFAULT_MASTER_INSTANCE_TYPE}; "
+            f"GCP default: {GCP_DEFAULT_MASTER_INSTANCE_TYPE}."
+        ),
+    )
+    deploy.add_argument(
+        "--worker-instance-type",
+        default=None,
+        help=(
+            f"Worker machine type. AWS default: {AWS_DEFAULT_WORKER_INSTANCE_TYPE}; "
+            f"GCP default: {GCP_DEFAULT_WORKER_INSTANCE_TYPE}."
+        ),
+    )
     deploy.add_argument("--workers", type=positive_int, default=1)
-    deploy.add_argument("--vpc-cidr", default="10.42.0.0/16")
-    deploy.add_argument("--public-subnet-cidr", default="10.42.1.0/24")
+    deploy.add_argument(
+        "--vpc-cidr",
+        default=None,
+        help=f"AWS VPC CIDR. AWS default: {AWS_DEFAULT_VPC_CIDR}.",
+    )
+    deploy.add_argument("--public-subnet-cidr", default=DEFAULT_SUBNET_CIDR)
     deploy.add_argument(
         "--vpc-id",
         default="",
@@ -1634,6 +2336,22 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Existing subnet ID for EC2 instances when --vpc-id is set. "
             "The subnet must have outbound internet access for package downloads."
+        ),
+    )
+    deploy.add_argument(
+        "--network",
+        default="",
+        help=(
+            "Existing GCP VPC network name to use instead of creating a network. "
+            "Must be provided together with --subnetwork."
+        ),
+    )
+    deploy.add_argument(
+        "--subnetwork",
+        default="",
+        help=(
+            "Existing GCP subnetwork name for Compute Engine instances. "
+            "Must be provided together with --network and be in --region."
         ),
     )
     deploy.add_argument(
@@ -1660,9 +2378,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional existing IAM instance profile for the EC2 instances.",
     )
     deploy.add_argument(
+        "--gcp-instance-service-account",
+        default="",
+        help=(
+            "Optional service account email to attach to GCP instances with the "
+            "cloud-platform OAuth scope. IAM roles must be granted separately."
+        ),
+    )
+    deploy.add_argument(
+        "--gcp-master-boot-disk-type",
+        default="",
+        help=(
+            "Optional GCP master boot disk type override. By default, the script "
+            "chooses pd-balanced or hyperdisk-balanced for the machine series."
+        ),
+    )
+    deploy.add_argument(
+        "--gcp-worker-boot-disk-type",
+        default="",
+        help=(
+            "Optional GCP worker boot disk type override. By default, the script "
+            "chooses pd-balanced or hyperdisk-balanced for the machine series."
+        ),
+    )
+    deploy.add_argument(
         "--owner-tag",
         default="",
-        help="Optional Owner tag value to apply to the Spark master and worker EC2 instances.",
+        help="Optional owner tag/label for the Spark master and worker instances.",
     )
     deploy.add_argument("--migration-type", choices=MIGRATION_TYPES, default="cql")
     deploy.add_argument(
@@ -1681,6 +2423,38 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     deploy.set_defaults(func=handle_deploy)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--state-dir",
+        default=DEFAULT_STATE_DIR,
+        help="Directory for generated Terraform files, state, inventory, and metadata.",
+    )
+    common.add_argument(
+        "--gcp-service-account-file",
+        default=None,
+        help=(
+            "Explicit GCP service account JSON key file. If omitted, GCP uses "
+            "Application Default Credentials. Later commands reuse the path "
+            "saved by deploy unless this option overrides it."
+        ),
+    )
+
+    parser = argparse.ArgumentParser(
+        description="Deploy and operate a Spark cluster for ScyllaDB Migrator.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    deploy = subparsers.add_parser(
+        "deploy",
+        parents=[common],
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        help="Create AWS or GCP infrastructure and configure Spark with Ansible.",
+    )
+    configure_deploy_parser(deploy)
 
     show = subparsers.add_parser(
         "show",

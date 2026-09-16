@@ -300,6 +300,15 @@ class DeploySparkClusterScriptTest extends munit.FunSuite {
     assertOutputContains(result.output, "--subnet-id")
     assertOutputContains(result.output, "--owner-tag")
     assertOutputContains(result.output, "--insecure-ssh")
+    assertOutputContains(result.output, "--cloud-provider {aws,gcp}")
+    assertOutputContains(result.output, "--gcp-project")
+    assertOutputContains(result.output, "--zone")
+    assertOutputContains(result.output, "--gcp-service-account-file")
+    assertOutputContains(result.output, "--gcp-instance-service-account")
+    assertOutputContains(result.output, "--network")
+    assertOutputContains(result.output, "--subnetwork")
+    assertOutputContains(result.output, "n2-custom-8-262144-ext")
+    assertOutputContains(result.output, "c4a-highmem-16")
   }
 
   test("deploy requires explicit SSH and web access CIDRs") {
@@ -447,7 +456,7 @@ class DeploySparkClusterScriptTest extends munit.FunSuite {
          |module.resolve_ssh_private_key = fail_private_key_resolution
          |module.require_commands = lambda commands: print("required=" + ",".join(commands))
          |module.run_command = lambda *args, **kwargs: print("run=" + " ".join(args[0]))
-         |module.terraform_output = lambda state_dir: outputs
+         |module.terraform_output = lambda state_dir, env=None: outputs
          |with tempfile.TemporaryDirectory() as temp_dir:
          |    state_dir = Path(temp_dir) / "state"
          |    public_key = Path(temp_dir) / "id_rsa.pub"
@@ -478,6 +487,85 @@ class DeploySparkClusterScriptTest extends munit.FunSuite {
     assert(!result.output.contains("ansible-playbook"), result.output)
   }
 
+  test("GCP deploy passes explicit credentials without invoking cloud APIs in tests") {
+    val result = runPython(
+      "-c",
+      s"""import importlib.util, json, tempfile
+         |from pathlib import Path
+         |spec = importlib.util.spec_from_file_location("deploy_spark_cluster", "${script}")
+         |module = importlib.util.module_from_spec(spec)
+         |spec.loader.exec_module(module)
+         |outputs = {
+         |    "master": {
+         |        "instance_id": "gcp-master",
+         |        "public_ip": "203.0.113.10",
+         |        "private_ip": "10.42.1.10",
+         |    },
+         |    "workers": [],
+         |    "spark_master_url": "spark://10.42.1.10:7077",
+         |    "spark_master_ui": "http://203.0.113.10:8080",
+         |    "spark_application_ui": "http://203.0.113.10:4040",
+         |    "spark_history_ui": "http://203.0.113.10:18080",
+         |    "vpc_id": "projects/example/global/networks/test",
+         |    "public_subnet_id": "projects/example/regions/us-central1/subnetworks/test",
+         |    "cluster_security_group_id": "internal-firewall",
+         |    "master_ui_security_group_id": "ui-firewall",
+         |    "key_name": "ubuntu (instance metadata)",
+         |}
+         |with tempfile.TemporaryDirectory() as temp_dir:
+         |    temp_path = Path(temp_dir)
+         |    state_dir = temp_path / "state"
+         |    public_key = temp_path / "id_rsa.pub"
+         |    public_key.write_text("ssh-rsa AAAAB3NzaTest user@example\\n")
+         |    credentials = temp_path / "service-account.json"
+         |    credentials.write_text(json.dumps({
+         |        "type": "service_account",
+         |        "project_id": "example-project",
+         |        "client_email": "deployer@example-project.iam.gserviceaccount.com",
+         |        "private_key": "not-a-real-private-key",
+         |    }))
+         |    expected_credentials = str(credentials.resolve())
+         |    module.require_commands = lambda commands: print("required=" + ",".join(commands))
+         |    def fake_run(command, **kwargs):
+         |        env = kwargs.get("env") or {}
+         |        print("run=" + " ".join(command))
+         |        print("run_credentials=" + str(env.get("GOOGLE_APPLICATION_CREDENTIALS") == expected_credentials))
+         |    module.run_command = fake_run
+         |    def fake_output(state_dir, *, env=None):
+         |        print("output_credentials=" + str(env["GOOGLE_APPLICATION_CREDENTIALS"] == expected_credentials))
+         |        return outputs
+         |    module.terraform_output = fake_output
+         |    args = module.build_parser().parse_args([
+         |        "deploy",
+         |        "--cloud-provider", "gcp",
+         |        "--gcp-project", "example-project",
+         |        "--gcp-service-account-file", str(credentials),
+         |        "--state-dir", str(state_dir),
+         |        "--skip-ansible",
+         |        "--ssh-public-key", str(public_key),
+         |        "--allowed-ssh-cidr", "203.0.113.10/32",
+         |        "--allowed-web-cidr", "203.0.113.10/32",
+         |    ])
+         |    module.handle_deploy(args)
+         |    metadata = module.read_json(state_dir / "metadata.json")
+         |    print("provider=" + metadata["cloud_provider"])
+         |    print("credentials_saved=" + str(metadata["gcp_service_account_file"] == expected_credentials))
+         |    print("master_type=" + metadata["master_instance_type"])
+         |    print("worker_type=" + metadata["worker_instance_type"])
+         |""".stripMargin
+    )
+
+    assertEquals(result.exitCode, 0, result.output)
+    assertOutputContains(result.output, "required=terraform")
+    assertEquals(result.output.split("run_credentials=True", -1).length - 1, 2)
+    assertOutputContains(result.output, "output_credentials=True")
+    assertOutputContains(result.output, "provider=gcp")
+    assertOutputContains(result.output, "credentials_saved=True")
+    assertOutputContains(result.output, "master_type=n2-custom-8-262144-ext")
+    assertOutputContains(result.output, "worker_type=c4a-highmem-16")
+    assert(!result.output.contains("ansible-playbook"), result.output)
+  }
+
   test("AWS architecture inference keeps x86 GPU families distinct from Graviton") {
     val result = runPython(
       "-c",
@@ -493,6 +581,264 @@ class DeploySparkClusterScriptTest extends munit.FunSuite {
 
     assertEquals(result.exitCode, 0, result.output)
     assertEquals(result.output.linesIterator.toList, List("arm64", "x86_64", "x86_64"))
+  }
+
+  test("cloud-specific defaults preserve AWS and size GCP comparably") {
+    val result = runPython(
+      "-c",
+      s"""import importlib.util
+         |spec = importlib.util.spec_from_file_location("deploy_spark_cluster", "${script}")
+         |module = importlib.util.module_from_spec(spec)
+         |spec.loader.exec_module(module)
+         |parser = module.build_parser()
+         |common = [
+         |    "deploy",
+         |    "--skip-ansible",
+         |    "--allowed-ssh-cidr", "203.0.113.10/32",
+         |    "--allowed-web-cidr", "203.0.113.10/32",
+         |]
+         |aws = parser.parse_args(common)
+         |module.apply_cloud_defaults(aws)
+         |print(aws.region, aws.master_instance_type, aws.worker_instance_type)
+         |gcp = parser.parse_args(common + [
+         |    "--cloud-provider", "gcp",
+         |    "--gcp-project", "example-project",
+         |])
+         |module.apply_cloud_defaults(gcp)
+         |print(gcp.region, gcp.zone, gcp.master_instance_type, gcp.worker_instance_type)
+         |print(module.infer_gcp_architecture(gcp.master_instance_type))
+         |print(module.infer_gcp_architecture(gcp.worker_instance_type))
+         |print(module.gcp_boot_disk_type(gcp.master_instance_type))
+         |print(module.gcp_boot_disk_type(gcp.worker_instance_type))
+         |""".stripMargin
+    )
+
+    assertEquals(result.exitCode, 0, result.output)
+    assertEquals(
+      result.output.linesIterator.toList,
+      List(
+        "us-east-1 x2iedn.2xlarge i8g.4xlarge",
+        "us-central1 us-central1-a n2-custom-8-262144-ext c4a-highmem-16",
+        "x86_64",
+        "arm64",
+        "pd-balanced",
+        "hyperdisk-balanced"
+      )
+    )
+  }
+
+  test("GCP Terraform generation uses Compute Engine and normalized outputs") {
+    val result = runPython(
+      "-c",
+      s"""import importlib.util, json, tempfile
+         |from pathlib import Path
+         |spec = importlib.util.spec_from_file_location("deploy_spark_cluster", "${script}")
+         |module = importlib.util.module_from_spec(spec)
+         |spec.loader.exec_module(module)
+         |with tempfile.TemporaryDirectory() as temp_dir:
+         |    temp_path = Path(temp_dir)
+         |    public_key = temp_path / "id_rsa.pub"
+         |    public_key.write_text("ssh-rsa AAAAB3NzaTest user@example\\n")
+         |    args = module.build_parser().parse_args([
+         |        "deploy",
+         |        "--cloud-provider", "gcp",
+         |        "--gcp-project", "example-project",
+         |        "--skip-ansible",
+         |        "--ssh-public-key", str(public_key),
+         |        "--network", "existing-network",
+         |        "--subnetwork", "existing-subnetwork",
+         |        "--gcp-instance-service-account",
+         |        "spark@example-project.iam.gserviceaccount.com",
+         |        "--allowed-ssh-cidr", "203.0.113.10/32",
+         |        "--allowed-web-cidr", "203.0.113.10/32",
+         |    ])
+         |    module.validate_cloud_args(args)
+         |    state_dir = temp_path / "state"
+         |    module.write_terraform_files(args, state_dir)
+         |    main = (state_dir / "main.tf").read_text()
+         |    tfvars = json.loads((state_dir / "terraform.tfvars.json").read_text())
+         |    print(tfvars["project_id"], tfvars["region"], tfvars["zone"])
+         |    print(tfvars["master_instance_type"], tfvars["worker_instance_type"])
+         |    print(tfvars["master_image_family"], tfvars["worker_image_family"])
+         |    print(tfvars["master_boot_disk_type"], tfvars["worker_boot_disk_type"])
+         |    print(tfvars["existing_network"], tfvars["existing_subnetwork"])
+         |    print(tfvars["instance_service_account"])
+         |    print("credentials" in tfvars)
+         |    for expected in (
+         |        'provider "google"',
+         |        'resource "google_compute_network" "spark"',
+         |        'resource "google_compute_firewall" "spark_ssh"',
+         |        'resource "google_compute_instance" "spark_master"',
+         |        'output "spark_master_url"',
+         |        'output "ssh_firewall_id"',
+         |        'block-project-ssh-keys = "true"',
+         |    ):
+         |        print(expected in main)
+         |""".stripMargin
+    )
+
+    assertEquals(result.exitCode, 0, result.output)
+    assertEquals(
+      result.output.linesIterator.toList,
+      List(
+        "example-project us-central1 us-central1-a",
+        "n2-custom-8-262144-ext c4a-highmem-16",
+        "ubuntu-2404-lts-amd64 ubuntu-2404-lts-arm64",
+        "pd-balanced hyperdisk-balanced",
+        "existing-network existing-subnetwork",
+        "spark@example-project.iam.gserviceaccount.com",
+        "False",
+        "True",
+        "True",
+        "True",
+        "True",
+        "True",
+        "True",
+        "True"
+      )
+    )
+  }
+
+  test("GCP service account files are validated and exported to Terraform") {
+    val result = runPython(
+      "-c",
+      s"""import importlib.util, json, tempfile
+         |from pathlib import Path
+         |spec = importlib.util.spec_from_file_location("deploy_spark_cluster", "${script}")
+         |module = importlib.util.module_from_spec(spec)
+         |spec.loader.exec_module(module)
+         |with tempfile.TemporaryDirectory() as temp_dir:
+         |    temp_path = Path(temp_dir)
+         |    valid = temp_path / "service-account.json"
+         |    valid.write_text(json.dumps({
+         |        "type": "service_account",
+         |        "project_id": "example-project",
+         |        "client_email": "deployer@example-project.iam.gserviceaccount.com",
+         |        "private_key": "not-a-real-private-key",
+         |    }))
+         |    env = module.terraform_auth_env("gcp", str(valid))
+         |    print(env["GOOGLE_APPLICATION_CREDENTIALS"] == str(valid.resolve()))
+         |    print(module.terraform_auth_env("gcp", None) is None)
+         |    saved_env = module.terraform_auth_env(
+         |        "gcp", None, {"gcp_service_account_file": str(valid)}
+         |    )
+         |    print(saved_env["GOOGLE_APPLICATION_CREDENTIALS"] == str(valid.resolve()))
+         |    invalid_json = temp_path / "invalid.json"
+         |    invalid_json.write_text("{bad json")
+         |    wrong_type = temp_path / "wrong-type.json"
+         |    wrong_type.write_text(json.dumps({"type": "external_account"}))
+         |    missing_fields = temp_path / "missing-fields.json"
+         |    missing_fields.write_text(json.dumps({"type": "service_account"}))
+         |    missing_file = temp_path / "missing.json"
+         |    credential_directory = temp_path / "credential-directory"
+         |    credential_directory.mkdir()
+         |    for path in (
+         |        missing_file,
+         |        credential_directory,
+         |        invalid_json,
+         |        wrong_type,
+         |        missing_fields,
+         |    ):
+         |        try:
+         |            module.terraform_auth_env("gcp", str(path))
+         |        except SystemExit as exc:
+         |            print(exc)
+         |    try:
+         |        module.terraform_auth_env("aws", str(valid))
+         |    except SystemExit as exc:
+         |        print(exc)
+         |""".stripMargin
+    )
+
+    assertEquals(result.exitCode, 0, result.output)
+    val lines = result.output.linesIterator.toList
+    assertEquals(lines.take(3), List("True", "True", "True"))
+    assertOutputContains(lines(3), "GCP service account file does not exist")
+    assertOutputContains(lines(4), "GCP service account path is not a file")
+    assertOutputContains(lines(5), "Invalid JSON in GCP service account file")
+    assertOutputContains(lines(6), "is not a service account key")
+    assertOutputContains(
+      lines(7),
+      "missing required field(s): project_id, client_email, private_key"
+    )
+    assertEquals(lines(8), "--gcp-service-account-file can only be used with GCP.")
+  }
+
+  test("GCP argument validation reports provider-specific mistakes") {
+    val base = Seq(
+      "deploy",
+      "--cloud-provider",
+      "gcp",
+      "--skip-ansible",
+      "--allowed-ssh-cidr",
+      "203.0.113.10/32",
+      "--allowed-web-cidr",
+      "203.0.113.10/32"
+    )
+
+    val missingProject = runScript(base: _*)
+    assertNotEquals(missingProject.exitCode, 0, missingProject.output)
+    assertOutputContains(
+      missingProject.output,
+      "--gcp-project is required when --cloud-provider=gcp"
+    )
+
+    val mismatchedZone = runScript(
+      (base ++ Seq(
+        "--gcp-project",
+        "example-project",
+        "--region",
+        "us-central1",
+        "--zone",
+        "us-east1-b"
+      )): _*
+    )
+    assertNotEquals(mismatchedZone.exitCode, 0, mismatchedZone.output)
+    assertOutputContains(mismatchedZone.output, "is not in the selected region")
+
+    val unpairedNetwork = runScript(
+      (base ++ Seq(
+        "--gcp-project",
+        "example-project",
+        "--network",
+        "existing-network"
+      )): _*
+    )
+    assertNotEquals(unpairedNetwork.exitCode, 0, unpairedNetwork.output)
+    assertOutputContains(
+      unpairedNetwork.output,
+      "--network and --subnetwork must be provided together"
+    )
+
+    val gcpVpcCidr = runScript(
+      (base ++ Seq(
+        "--gcp-project",
+        "example-project",
+        "--vpc-cidr",
+        "10.42.0.0/16"
+      )): _*
+    )
+    assertNotEquals(gcpVpcCidr.exitCode, 0, gcpVpcCidr.output)
+    assertOutputContains(
+      gcpVpcCidr.output,
+      "--vpc-cidr is AWS-only because GCP VPC networks do not have a network-wide CIDR"
+    )
+
+    val awsWithGcpProject = runScript(
+      "deploy",
+      "--skip-ansible",
+      "--gcp-project",
+      "example-project",
+      "--allowed-ssh-cidr",
+      "203.0.113.10/32",
+      "--allowed-web-cidr",
+      "203.0.113.10/32"
+    )
+    assertNotEquals(awsWithGcpProject.exitCode, 0, awsWithGcpProject.output)
+    assertOutputContains(
+      awsWithGcpProject.output,
+      "--gcp-project can only be used with GCP"
+    )
   }
 
   test("allow-public-access gates the public CIDR guard") {
@@ -704,7 +1050,7 @@ class DeploySparkClusterScriptTest extends munit.FunSuite {
       deployScript,
       "require_commands([\"terraform\", \"ansible-playbook\", \"ssh\", \"scp\"])"
     )
-    assertOutputContains(deployScript, "outputs = terraform_output(state_dir)")
+    assertOutputContains(deployScript, "outputs = terraform_output(state_dir, env=terraform_env)")
     assertOutputContains(deployScript, "metadata[\"terraform_outputs\"] = outputs")
     assertOutputContains(deployScript, "inventory_path = write_ansible_inventory(")
     assertOutputContains(
@@ -778,6 +1124,21 @@ class DeploySparkClusterScriptTest extends munit.FunSuite {
     assert(!requirements.contains("ansible-core\n"), requirements)
     assertOutputContains(readme, "pip install -r requirements.txt")
     assertOutputContains(readme, "`ansible-core` is pinned")
+  }
+
+  test("deploy documentation covers GCP sizing and authentication choices") {
+    val readme = Files.readString(repoRoot.resolve("README.md"))
+
+    assertOutputContains(readme, "Application Default Credentials (ADC)")
+    assertOutputContains(readme, "gcloud auth application-default login")
+    assertOutputContains(readme, "`GOOGLE_APPLICATION_CREDENTIALS`")
+    assertOutputContains(readme, "`--gcp-service-account-file`")
+    assertOutputContains(readme, "`--gcp-instance-service-account`")
+    assertOutputContains(readme, "`n2-custom-8-262144-ext`")
+    assertOutputContains(readme, "`c4a-highmem-16`")
+    assertOutputContains(readme, "8 x86_64 vCPUs and 256 GiB")
+    assertOutputContains(readme, "16 Google Axion Arm vCPUs and 128 GiB")
+    assertOutputContains(readme, "key contents are never copied")
   }
 
   test("test workflow runs for deploy helper and Ansible changes") {
