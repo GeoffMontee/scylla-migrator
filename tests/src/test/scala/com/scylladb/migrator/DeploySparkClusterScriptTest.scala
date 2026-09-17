@@ -729,9 +729,11 @@ class DeploySparkClusterScriptTest extends munit.FunSuite {
          |        'output "ssh_firewall_id"',
          |        'block-project-ssh-keys = "true"',
          |        'source_tags = [local.cluster_tag]',
+         |        'condition = local.use_existing_network ? (',
          |    ):
          |        print(expected in main)
          |    print('source_ranges = [local.subnetwork_cidr]' not in main)
+         |    print('!local.use_existing_network ||' not in main)
          |""".stripMargin
     )
 
@@ -746,6 +748,8 @@ class DeploySparkClusterScriptTest extends munit.FunSuite {
         "existing-network existing-subnetwork",
         "spark@example-project.iam.gserviceaccount.com",
         "False",
+        "True",
+        "True",
         "True",
         "True",
         "True",

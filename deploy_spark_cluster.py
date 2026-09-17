@@ -614,10 +614,9 @@ resource "google_compute_firewall" "spark_internal" {
 
   lifecycle {
     precondition {
-      condition = (
-        !local.use_existing_network ||
+      condition = local.use_existing_network ? (
         data.google_compute_subnetwork.existing[0].network == data.google_compute_network.existing[0].self_link
-      )
+      ) : true
       error_message = "The selected GCP subnetwork does not belong to the selected network."
     }
   }
